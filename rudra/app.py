@@ -1,0 +1,457 @@
+﻿from __future__ import annotations
+
+import os
+import platform
+import queue
+import shutil
+import subprocess
+import threading
+import time
+import tkinter as tk
+from tkinter import ttk, messagebox
+from maintenance import clean_temp_files
+from dataclasses import dataclass
+from typing import Callable, Any
+from datetime import datetime
+
+APP_NAME = "RUDRA"
+APP_VERSION = "0.3.0"
+
+
+@dataclass
+class TaskEvent:
+    task_id: int
+    kind: str
+    message: str
+    payload: Any = None
+
+
+class CancellationToken:
+    def __init__(self):
+        self._event = threading.Event()
+
+    def cancel(self):
+        self._event.set()
+
+    def cancelled(self):
+        return self._event.is_set()
+
+    def checkpoint(self):
+        if self.cancelled():
+            raise InterruptedError("Task cancelled.")
+
+
+def run_powershell(script: str, timeout: int = 20, cancel: CancellationToken | None = None) -> str:
+    """Only call with built-in, reviewed scripts. Never pass raw user text here."""
+    if cancel:
+        cancel.checkpoint()
+    cmd = [
+        "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+        "-ExecutionPolicy", "RemoteSigned", "-Command", script
+    ]
+    completed = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=timeout,
+        errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    )
+    out = (completed.stdout or "").strip()
+    err = (completed.stderr or "").strip()
+    combined = out + (("\n\nSTDERR:\n" + err) if err else "")
+    if completed.returncode != 0:
+        raise RuntimeError(f"PowerShell exited with code {completed.returncode}.\n{combined[:8000]}")
+    return combined[:14000] or "(No output)"
+
+
+def system_snapshot(progress, cancel):
+    progress("Reading Windows, CPU and memory countersâ€¦")
+    script = r"""
+$os = Get-CimInstance Win32_OperatingSystem
+$cpu = Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average
+$memTotal = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
+$memFree = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
+$uptime = (Get-Date) - $os.LastBootUpTime
+[pscustomobject]@{
+ Computer = $env:COMPUTERNAME
+ Windows = $os.Caption
+ Version = $os.Version
+ Build = $os.BuildNumber
+ LastBoot = $os.LastBootUpTime
+ Uptime = ('{0}d {1}h {2}m' -f [int]$uptime.TotalDays, $uptime.Hours, $uptime.Minutes)
+ CpuLoadPercent = [int]$cpu.Average
+ RamTotalGB = $memTotal
+ RamFreeGB = $memFree
+ RamUsedPercent = [math]::Round((1 - ($os.FreePhysicalMemory / $os.TotalVisibleMemorySize)) * 100, 1)
+} | Format-List
+"""
+    cancel.checkpoint()
+    result = run_powershell(script, 20, cancel)
+    progress("System snapshot collected.")
+    return result
+
+
+def network_diagnostics(progress, cancel):
+    progress("Checking adapters, default gateway and DNSâ€¦")
+    script = r"""
+'=== ADAPTERS ==='
+Get-NetAdapter | Sort-Object Name | Select-Object Name, InterfaceDescription, Status, LinkSpeed | Format-Table -AutoSize
+'=== IPV4 / GATEWAY ==='
+Get-NetIPConfiguration | Where-Object {$_.IPv4Address} | Select-Object InterfaceAlias,
+ @{N='IPv4';E={($_.IPv4Address.IPAddress -join ', ')}},
+ @{N='Gateway';E={($_.IPv4DefaultGateway.NextHop -join ', ')}} | Format-Table -AutoSize
+'=== WLAN SERVICE ==='
+Get-Service WlanSvc | Select-Object Name, Status, StartType | Format-List
+'=== QUICK TESTS ==='
+$gw = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+ Sort-Object RouteMetric | Select-Object -First 1 -ExpandProperty NextHop
+if ($gw) { "Gateway: $gw"; "Gateway ping: $([bool](Test-Connection -ComputerName $gw -Count 1 -Quiet -ErrorAction SilentlyContinue))" }
+else { 'Gateway: Not found' }
+try { Resolve-DnsName example.com -ErrorAction Stop | Select-Object -First 1 Name, Type, IPAddress | Format-Table -AutoSize; 'DNS resolution: True' }
+catch { 'DNS resolution: False'; $_.Exception.Message }
+"""
+    cancel.checkpoint()
+    result = run_powershell(script, 25, cancel)
+    progress("Network checks completed.")
+    return result
+
+
+def disk_report(progress, cancel):
+    progress("Reading fixed-drive capacityâ€¦")
+    script = r"""
+Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" |
+ Select-Object DeviceID, VolumeName,
+ @{N='SizeGB';E={[math]::Round($_.Size / 1GB, 1)}},
+ @{N='FreeGB';E={[math]::Round($_.FreeSpace / 1GB, 1)}},
+ @{N='FreePercent';E={if ($_.Size) {[math]::Round(100*$_.FreeSpace/$_.Size, 1)} else {0}}} |
+ Format-Table -AutoSize
+"""
+    cancel.checkpoint()
+    result = run_powershell(script, 20, cancel)
+    progress("Drive report collected.")
+    return result
+
+
+def top_processes(progress, cancel):
+    progress("Reading top processes by working-set memoryâ€¦")
+    script = r"""
+Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 15 `
+ @{N='Process';E={$_.ProcessName}},
+ @{N='RAM_MB';E={[math]::Round($_.WorkingSet64 / 1MB, 1)}},
+ CPU, Id | Format-Table -AutoSize
+"""
+    cancel.checkpoint()
+    result = run_powershell(script, 20, cancel)
+    progress("Process list collected.")
+    return result
+
+
+def open_target(target):
+    # Explicit allow-list: user input never becomes a shell command.
+    targets = {
+        "settings": ["cmd.exe", "/c", "start", "", "ms-settings:"],
+        "notepad": ["notepad.exe"],
+        "task manager": ["taskmgr.exe"],
+        "device manager": ["mmc.exe", "devmgmt.msc"],
+        "network settings": ["cmd.exe", "/c", "start", "", "ms-settings:network-status"],
+        "sound settings": ["cmd.exe", "/c", "start", "", "ms-settings:sound"],
+        "display settings": ["cmd.exe", "/c", "start", "", "ms-settings:display"],
+        "bluetooth settings": ["cmd.exe", "/c", "start", "", "ms-settings:bluetooth"],
+        "installed apps": ["cmd.exe", "/c", "start", "", "ms-settings:appsfeatures"],
+        "windows update": ["cmd.exe", "/c", "start", "", "ms-settings:windowsupdate"],
+        "file explorer": ["explorer.exe"],
+        "command prompt": ["cmd.exe"],
+        "powershell": ["powershell.exe", "-NoLogo"],
+        "snipping tool": ["SnippingTool.exe"],
+        "calculator": ["calc.exe"],
+    }
+    if target not in targets:
+        raise ValueError("This action is not in RUDRA's approved app allow-list.")
+    subprocess.Popen(targets[target], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if target in ("settings", "network settings", "sound settings", "display settings", "bluetooth settings", "installed apps", "windows update") else 0)
+
+
+class RudraApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("RUDRA â€” Advanced Windows AI Operator")
+        self.root.geometry("1040x720")
+        self.root.minsize(860, 600)
+        self.root.configure(bg="#10141c")
+        self.events = queue.Queue()
+        self.task_counter = 0
+        self.active_token = None
+        self.busy = False
+        self.history = []
+        self._style()
+        self._build_ui()
+        self._log("RUDRA ready. Local quick actions and read-only diagnostics are available.")
+        self._set_status("Ready")
+        self.root.after(100, self._poll_events)
+
+    def _style(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(".", font=("Segoe UI", 10))
+        style.configure("TFrame", background="#10141c")
+        style.configure("Card.TFrame", background="#181f2b")
+        style.configure("TLabel", background="#10141c", foreground="#e7edf7")
+        style.configure("Muted.TLabel", background="#10141c", foreground="#9aa8bd")
+        style.configure("Card.TLabel", background="#181f2b", foreground="#e7edf7")
+        style.configure("Title.TLabel", background="#10141c", foreground="#ffffff", font=("Segoe UI Semibold", 24))
+        style.configure("Subtitle.TLabel", background="#10141c", foreground="#9aa8bd", font=("Segoe UI", 10))
+        style.configure("TButton", padding=(10, 7))
+        style.configure("Accent.TButton", background="#3b82f6", foreground="#ffffff")
+        style.map("Accent.TButton", background=[("active", "#2563eb")])
+        style.configure("TNotebook", background="#10141c", borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(15, 8), background="#202938", foreground="#dbe5f5")
+        style.map("TNotebook.Tab", background=[("selected", "#3b82f6")], foreground=[("selected", "#ffffff")])
+        style.configure("Treeview", background="#181f2b", foreground="#e7edf7", fieldbackground="#181f2b", rowheight=28)
+        style.configure("Treeview.Heading", background="#263244", foreground="#ffffff")
+
+    def _build_ui(self):
+        header = ttk.Frame(self.root, padding=(22, 18, 22, 8))
+        header.pack(fill="x")
+        title_row = ttk.Frame(header)
+        title_row.pack(fill="x")
+        ttk.Label(title_row, text="RUDRA", style="Title.TLabel").pack(side="left")
+        ttk.Label(title_row, text=f"  ADVANCED WINDOWS OPERATOR  Â·  v{APP_VERSION}", style="Subtitle.TLabel").pack(side="left", padx=(12, 0), pady=(10, 0))
+        self.status_var = tk.StringVar(value="Ready")
+        ttk.Label(title_row, textvariable=self.status_var, style="Subtitle.TLabel").pack(side="right", pady=(10, 0))
+        ttk.Label(header, text="Think â†’ choose an approved tool â†’ execute â†’ verify. Built to stay lightweight and responsive.", style="Subtitle.TLabel").pack(anchor="w", pady=(6, 0))
+
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=22, pady=(8, 10))
+        self.home_tab = ttk.Frame(self.notebook, padding=16)
+        self.quick_tab = ttk.Frame(self.notebook, padding=16)
+        self.diag_tab = ttk.Frame(self.notebook, padding=16)
+        self.activity_tab = ttk.Frame(self.notebook, padding=16)
+        self.notebook.add(self.home_tab, text="Overview")
+        self.notebook.add(self.quick_tab, text="Quick Actions")
+        self.notebook.add(self.diag_tab, text="Diagnostics")
+        self.notebook.add(self.activity_tab, text="Activity & Logs")
+        self._build_home()
+        self._build_quick()
+        self._build_diagnostics()
+        self._build_activity()
+
+        footer = ttk.Frame(self.root, padding=(22, 0, 22, 14))
+        footer.pack(fill="x")
+        ttk.Label(footer, text="Safety: no arbitrary shell input â€¢ diagnostics are read-only â€¢ admin changes are not enabled in this build", style="Subtitle.TLabel").pack(side="left")
+        ttk.Button(footer, text="Cancel current task", command=self.cancel_task).pack(side="right")
+
+    def _card(self, parent, title, body, col=0):
+        frame = ttk.Frame(parent, style="Card.TFrame", padding=15)
+        ttk.Label(frame, text=title, style="Card.TLabel", font=("Segoe UI Semibold", 12)).pack(anchor="w")
+        ttk.Label(frame, text=body, style="Card.TLabel", wraplength=260, justify="left").pack(anchor="w", pady=(7, 0))
+        return frame
+
+    def _build_home(self):
+        ttk.Label(self.home_tab, text="Welcome back.", font=("Segoe UI Semibold", 18)).pack(anchor="w")
+        ttk.Label(self.home_tab, text="What should RUDRA do for you?", style="Subtitle.TLabel").pack(anchor="w", pady=(3, 14))
+        cards = ttk.Frame(self.home_tab)
+        cards.pack(fill="x")
+        specs = [
+            ("System intelligence", "CPU, memory, Windows build and uptime snapshot.", lambda: self.run_task("System health snapshot", system_snapshot)),
+            ("Network intelligence", "Adapter state, gateway, WLAN service and DNS checks.", lambda: self.run_task("Network diagnostics", network_diagnostics)),
+            ("Storage overview", "Check fixed-drive capacity and free space.", lambda: self.run_task("Disk space report", disk_report)),
+            ("Performance clues", "List top processes by memory use.", lambda: self.run_task("Top memory processes", top_processes)),
+        ]
+        for i, (title, body, command) in enumerate(specs):
+            card = self._card(cards, title, body)
+            card.grid(row=i//2, column=i%2, sticky="nsew", padx=6, pady=6)
+            ttk.Button(card, text="Run check", command=command).pack(anchor="w", pady=(12, 0))
+        cards.columnconfigure(0, weight=1)
+        cards.columnconfigure(1, weight=1)
+        command_box = ttk.LabelFrame(self.home_tab, text="Quick command", padding=12)
+        command_box.pack(fill="x", pady=(18, 0))
+        self.command_var = tk.StringVar()
+        self.command_entry = ttk.Entry(command_box, textvariable=self.command_var)
+        self.command_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.command_entry.bind("<Return>", lambda _e: self.handle_command())
+        ttk.Button(command_box, text="Run", style="Accent.TButton", command=self.handle_command).pack(side="right")
+        ttk.Label(self.home_tab, text='Try: "open task manager", "network check", "disk report", "system status", "open device manager".', style="Subtitle.TLabel", wraplength=800).pack(anchor="w", pady=(8, 0))
+
+    def _build_quick(self):
+        ttk.Label(self.quick_tab, text="Approved quick actions", font=("Segoe UI Semibold", 18)).pack(anchor="w")
+        ttk.Label(self.quick_tab, text="These launch local Windows tools or Settings pages. No command text is executed directly.", style="Subtitle.TLabel").pack(anchor="w", pady=(3, 14))
+        targets = [
+            ("Settings", "settings"), ("Network settings", "network settings"),
+            ("Device Manager", "device manager"), ("Task Manager", "task manager"),
+            ("Notepad", "notepad"), ("File Explorer", "file explorer"),
+            ("Windows Update", "windows update"),
+            ("Clean Temp + Prefetch", "clean_temp"), ("Display settings", "display settings"),
+            ("Sound settings", "sound settings"), ("Bluetooth settings", "bluetooth settings"),
+            ("Installed apps", "installed apps"), ("Calculator", "calculator"),
+            ("Snipping Tool", "snipping tool"), ("Command Prompt", "command prompt"),
+            ("PowerShell", "powershell"),
+        ]
+        grid = ttk.Frame(self.quick_tab)
+        grid.pack(fill="both", expand=True)
+        for i, (label, target) in enumerate(targets):
+            ttk.Button(grid, text=label, command=lambda t=target: self.launch_target(t)).grid(row=i//3, column=i%3, sticky="ew", padx=5, pady=5)
+        for c in range(3):
+            grid.columnconfigure(c, weight=1)
+
+    def _build_diagnostics(self):
+        ttk.Label(self.diag_tab, text="Read-only diagnostics", font=("Segoe UI Semibold", 18)).pack(anchor="w")
+        ttk.Label(self.diag_tab, text="Start with evidence before changing system settings.", style="Subtitle.TLabel").pack(anchor="w", pady=(3, 14))
+        items = [
+            ("System health", "CPU / RAM / Windows version / uptime", lambda: self.run_task("System health snapshot", system_snapshot)),
+            ("Network", "Adapters / gateway / DNS / WLAN service", lambda: self.run_task("Network diagnostics", network_diagnostics)),
+            ("Disk space", "Fixed-drive total and free capacity", lambda: self.run_task("Disk space report", disk_report)),
+            ("Top processes", "Largest working-set memory consumers", lambda: self.run_task("Top memory processes", top_processes)),
+        ]
+        for title, desc, fn in items:
+            row = ttk.Frame(self.diag_tab, style="Card.TFrame", padding=12)
+            row.pack(fill="x", pady=5)
+            ttk.Label(row, text=title, style="Card.TLabel", font=("Segoe UI Semibold", 11)).pack(side="left")
+            ttk.Label(row, text=desc, style="Card.TLabel").pack(side="left", padx=15)
+            ttk.Button(row, text="Run", command=fn).pack(side="right")
+
+    def _build_activity(self):
+        ttk.Label(self.activity_tab, text="Task activity", font=("Segoe UI Semibold", 18)).pack(anchor="w")
+        ttk.Label(self.activity_tab, text="Task output, errors and execution history appear here.", style="Subtitle.TLabel").pack(anchor="w", pady=(3, 10))
+        self.log_text = tk.Text(self.activity_tab, height=20, bg="#0b0f16", fg="#d7e0ee", insertbackground="white", relief="flat", wrap="word", font=("Consolas", 9))
+        self.log_text.pack(fill="both", expand=True)
+        self.log_text.configure(state="disabled")
+
+    def _set_status(self, text):
+        self.status_var.set(text)
+
+    def _log(self, text):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        line = f"[{stamp}] {text}\n"
+        self.history.append(line)
+        if hasattr(self, "log_text"):
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", line)
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+
+    def _event(self, task_id, kind, message, payload=None):
+        self.events.put(TaskEvent(task_id, kind, message, payload))
+
+    def run_task(self, name, fn):
+        if self.busy:
+            self._log("Another task is running; wait for it or cancel it first.")
+            return
+        self.task_counter += 1
+        task_id = self.task_counter
+        token = CancellationToken()
+        self.active_token = token
+        self.busy = True
+        self._set_status("Workingâ€¦")
+        self._log(f"Task #{task_id} started: {name}")
+        self.notebook.select(self.activity_tab)
+
+        def progress(message):
+            self._event(task_id, "progress", message)
+
+        def worker():
+            start = time.perf_counter()
+            try:
+                result = fn(progress, token)
+                token.checkpoint()
+                self._event(task_id, "complete", f"{name} completed in {time.perf_counter()-start:.1f}s", result)
+            except Exception as exc:
+                self._event(task_id, "error", f"{name} failed: {exc}")
+
+        threading.Thread(target=worker, name=f"RUDRA-{task_id}", daemon=True).start()
+
+    def run_temp_cleaner(self):
+        self.run_task("Temp + Windows Temp + Prefetch cleanup", clean_temp_files)
+
+    def launch_target(self, target):
+        if target == "clean_temp":
+            self.run_temp_cleaner()
+            return
+        try:
+            open_target(target)
+            self._log(f"Launch requested: {target}")
+            self._set_status("Ready")
+        except Exception as exc:
+            self._log(f"Could not launch {target}: {exc}")
+            messagebox.showerror("RUDRA", str(exc))
+
+    def handle_command(self):
+        raw = self.command_var.get().strip()
+        if not raw:
+            return
+        text = raw.casefold().strip()
+        self.command_var.set("")
+        # Intentionally narrow parser: map known phrases to registered tools.
+        if any(p in text for p in ("system status", "system health", "pc status", "computer status", "system check")):
+            self.run_task("System health snapshot", system_snapshot)
+        elif any(p in text for p in ("network check", "network status", "internet check", "wifi check", "wi-fi check", "internet slow")):
+            self.run_task("Network diagnostics", network_diagnostics)
+        elif any(p in text for p in ("disk report", "storage check", "disk space", "storage status")):
+            self.run_task("Disk space report", disk_report)
+        elif any(p in text for p in ("top processes", "memory use", "ram usage", "high ram")):
+            self.run_task("Top memory processes", top_processes)
+        else:
+            aliases = {
+                "settings": "settings", "open settings": "settings", "settings kholo": "settings",
+                "notepad": "notepad", "open notepad": "notepad", "notepad kholo": "notepad",
+                "task manager": "task manager", "open task manager": "task manager", "task manager kholo": "task manager",
+                "device manager": "device manager", "open device manager": "device manager",
+                "network settings": "network settings", "open network settings": "network settings",
+                "file explorer": "file explorer", "open file explorer": "file explorer",
+                "calculator": "calculator", "open calculator": "calculator",
+                "windows update": "windows update", "open windows update": "windows update",
+                "display settings": "display settings", "sound settings": "sound settings",
+                "bluetooth settings": "bluetooth settings", "installed apps": "installed apps",
+                "command prompt": "command prompt", "powershell": "powershell",
+                "snipping tool": "snipping tool",
+            }
+            target = aliases.get(text)
+            if target:
+                self.launch_target(target)
+            else:
+                self._log(f"Command not recognized: {raw!r}. Try a listed phrase; AI planning/voice are not in this build.")
+                self._set_status("Command not recognized")
+
+    def cancel_task(self):
+        if self.active_token and self.busy:
+            self.active_token.cancel()
+            self._log("Cancellation requested. The current OS query may take a moment to return.")
+        else:
+            self._log("No active task to cancel.")
+
+    def _poll_events(self):
+        try:
+            while True:
+                event = self.events.get_nowait()
+                if event.task_id != self.task_counter:
+                    continue
+                if event.kind == "progress":
+                    self._log(event.message)
+                elif event.kind == "complete":
+                    self.busy = False
+                    self.active_token = None
+                    self._set_status("Ready")
+                    self._log(event.message)
+                    self._log("----- RESULT -----")
+                    self._log(str(event.payload))
+                    self._log("------------------")
+                elif event.kind == "error":
+                    self.busy = False
+                    self.active_token = None
+                    self._set_status("Error")
+                    self._log(event.message)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_events)
+
+
+def main():
+    if platform.system() != "Windows":
+        print("RUDRA is designed for Windows 10/11.")
+        return
+    root = tk.Tk()
+    RudraApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+
